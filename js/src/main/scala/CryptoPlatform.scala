@@ -74,7 +74,7 @@ private[scoin] trait CryptoPlatform {
       )
 
     def publicKey: PublicKey = PublicKey(
-      ByteVector.view(Secp256k1.getPublicKey(value.bytes.toUint8Array))
+      PublicKey.toCompressedUnsafe(ByteVector.view(Secp256k1.getPublicKey(privateKey = value.bytes.toUint8Array)).toArray).value
     )
   }
 

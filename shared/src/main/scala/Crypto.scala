@@ -120,7 +120,7 @@ object Crypto extends CryptoPlatform {
       * @return
       *   an immutable compressed public key
       */
-    private def toCompressedUnsafe(key: Array[Byte]): PublicKey = {
+    private[scoin] def toCompressedUnsafe(key: Array[Byte]): PublicKey = {
       key.length match {
         case 65 if key(0) == 4 || key(0) == 6 || key(0) == 7 =>
           key(0) = if ((key(64) & 0x01) != 0) 0x03.toByte else 0x02.toByte
