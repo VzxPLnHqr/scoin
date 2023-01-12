@@ -8,52 +8,111 @@ object Crypto extends DefaultCrypto {
   object reckless extends scoin.reckless.PureAndRecklessCrypto
 }
 
-trait DefaultCrypto extends Crypto
-
-trait Crypto extends CryptoPlatform {
-  lazy val halfCurveOrder = N.shiftRight(1)
-
-  def fixSize(data: ByteVector): ByteVector32 = ByteVector32(data.padLeft(32))
-
-  /** Secp256k1 private key, which a 32 bytes value We assume that private keys
-    * are compressed i.e. that the corresponding public key is compressed
-    *
-    * @param value
-    *   value to initialize this key with
-    */
-  case class PrivateKey(value: ByteVector32) extends PrivateKeyPlatform(value) {
-    def +(that: PrivateKey): PrivateKey = add(that)
-    def -(that: PrivateKey): PrivateKey = subtract(that)
-    def *(that: PrivateKey): PrivateKey = multiply(that)
-
-    /**
-      * Negate a private key
-      * This is a naive slow implementation but works on every platform
-      * @return negation of private key
-      */
-    def negate: PrivateKey = PrivateKey((BigInt(N)-BigInt(value.toHex,16)).mod(N))
-
-    def xOnlyPublicKey: XOnlyPublicKey = XOnlyPublicKey(publicKey)
-
-    /** @param prefix
-      *   Private key prefix
-      * @return
-      *   the private key in Base58 (WIF) compressed format
-      */
-    def toBase58(prefix: Byte) =
-      Base58Check.encode(prefix, value.bytes :+ 1.toByte)
-
-    /**
-      * Tweak this private key with the scalar value of `tweak32`
-      * 
-      * @param tweak32 the value (possibly a merkleRoot) used to tweak the private key
-      * @return tweaked private key
-      */
-    def tweak(tweak32: ByteVector32): PrivateKey = {
-      val key = if (publicKey.isEven) this else this.negate
-      key + PrivateKey(tweak32)
-    }
+/**
+  * The Crypto trait implements as many methods as possible in a
+  * platform-independent manner. Methods which are to be implemented in
+  * a platform-specific manner are left abstract.
+  */
+trait Crypto {
+  // abstract methods and data structures
+  abstract class PrivateKeyPlatform(value: ByteVector32) {
+    def add(that: PrivateKey): PrivateKey = privateAdd(value,that)
+    def subtract(that: PrivateKey): PrivateKey = privateSubtract(value,that)
+    def multiply(that: PrivateKey): PrivateKey = privateMultiply(value,that)
+    def publicKey: PublicKey = privateToPublicKey(value)
   }
+  abstract class PublicKeyPlatform(value: ByteVector) {
+    def add(that: PublicKey): PublicKey = publicAdd(value,that)
+    def subtract(that: PublicKey): PublicKey = publicSubtract(value,that)
+    def multiply(that: PrivateKey): PublicKey = publicMultiplyByPrivateKey(value,that)
+    def toUncompressedBin: ByteVector = publicToUncompressedBin(value)
+  }
+
+  def privateAdd(value: ByteVector32,that: PrivateKey): PrivateKey
+  def privateSubtract(value: ByteVector,that: PrivateKey): PrivateKey
+  def privateMultiply(value: ByteVector32, that: PrivateKey): PrivateKey
+  def privateToPublicKey(value: ByteVector32): PublicKey
+  
+  def publicAdd(value: ByteVector,that:PublicKey): PublicKey
+  def publicSubtract(value: ByteVector, that: PublicKey): PublicKey
+  def publicMultiplyByPrivateKey(value: ByteVector, that: PrivateKey): PublicKey
+  def publicToUncompressedBin(value: ByteVector): ByteVector
+
+  def sha256(x: ByteVector): ByteVector32
+  def sha512(x: ByteVector): ByteVector
+  def hmac512(key: ByteVector, data: ByteVector): ByteVector
+  def hmac256(key: ByteVector, message: ByteVector): ByteVector32
+  def ripemd160(input: ByteVector): ByteVector
+
+  val N: BigInt //can be made concrete, too lazy to lookup value right now
+  val halfCurveOrder: BigInt // can be made concrete
+
+    /** @param key
+    *   serialized public key
+    * @return
+    *   true if the key is valid. This check is much more expensive than its lax
+    *   version since here we check that the public key is a valid point on the
+    *   secp256k1 curve
+    */
+  def isPubKeyValidStrict(key: ByteVector): Boolean
+
+  /** @param data
+    *   data
+    * @param signature
+    *   signature
+    * @param publicKey
+    *   public key
+    * @return
+    *   true is signature is valid for this data with this public key
+    */
+  def verifySignature(
+      data: ByteVector,
+      signature: ByteVector64,
+      publicKey: PublicKey
+  ): Boolean
+
+  /** Sign data with a private key, using RCF6979 deterministic signatures
+    *
+    * @param data
+    *   data to sign
+    * @param privateKey
+    *   private key. If you are using bitcoin "compressed" private keys make
+    *   sure to only use the first 32 bytes of the key (there is an extra "1"
+    *   appended to the key)
+    * @return
+    *   a signature in compact format (64 bytes)
+    */
+  def sign(data: ByteVector, privateKey: PrivateKey): ByteVector64
+
+  /** Verify a BIP340 schnorr signature
+    *
+    * @param data
+    * @param signature
+    * @param publicKey
+    * @return
+    */
+  def verifySignatureSchnorr(
+      signature: ByteVector64,
+      data: ByteVector32,
+      publicKey: XOnlyPublicKey
+  ): Boolean
+
+  /** Sign according to BIP340 specification
+    * https://github.com/bitcoin/bips/blob/master/bip-0340.mediawiki
+    *
+    * @param data
+    *   data to sign (32 bytes)
+    * @param privateKey
+    *   private key
+    * @param auxrand32
+    * @return
+    */
+  def signSchnorr(
+      data: ByteVector32,
+      privateKey: PrivateKey,
+      auxrand32: Option[ByteVector32] = None
+  ): ByteVector64
+
 
   object PrivateKey {
     def apply(data: ByteVector): PrivateKey = new PrivateKey(
@@ -100,29 +159,44 @@ trait Crypto extends CryptoPlatform {
     }
   }
 
-  /** Secp256k1 Public key We assume that public keys are always compressed
+    /** Secp256k1 private key, which a 32 bytes value We assume that private keys
+    * are compressed i.e. that the corresponding public key is compressed
     *
     * @param value
-    *   serialized public key, in compressed format (33 bytes)
+    *   value to initialize this key with
     */
-  case class PublicKey(value: ByteVector) extends PublicKeyPlatform(value) {
-    require(
-      value.length == 33,
-      s"pubkey is ${value.length} bytes but should be 33 bytes"
-    )
-    require(isPubKeyValidLax(value), "pubkey is not valid")
+  case class PrivateKey(value: ByteVector32) extends PrivateKeyPlatform(value) {
+    def +(that: PrivateKey): PrivateKey = add(that)
+    def -(that: PrivateKey): PrivateKey = subtract(that)
+    def *(that: PrivateKey): PrivateKey = multiply(that)
 
-    def hash160: ByteVector = Crypto.hash160(value)
-    def xonly: XOnlyPublicKey = XOnlyPublicKey(this)
-    def isValid: Boolean = isPubKeyValidStrict(this.value)
-    def isEven: Boolean = value(0) == 2.toByte
-    def isOdd: Boolean = !isEven
+    /**
+      * Negate a private key
+      * This is a naive slow implementation but works on every platform
+      * @return negation of private key
+      */
+    def negate: PrivateKey = PrivateKey((N-BigInt(value.toHex,16)).mod(N))
 
-    def +(that: PublicKey): PublicKey = add(that)
-    def -(that: PublicKey): PublicKey = subtract(that)
-    def *(that: PrivateKey): PublicKey = multiply(that)
+    def xOnlyPublicKey: XOnlyPublicKey = XOnlyPublicKey(publicKey)
 
-    override def toString = value.toHex
+    /** @param prefix
+      *   Private key prefix
+      * @return
+      *   the private key in Base58 (WIF) compressed format
+      */
+    def toBase58(prefix: Byte) =
+      Base58Check.encode(prefix, value.bytes :+ 1.toByte)
+
+    /**
+      * Tweak this private key with the scalar value of `tweak32`
+      * 
+      * @param tweak32 the value (possibly a merkleRoot) used to tweak the private key
+      * @return tweaked private key
+      */
+    def tweak(tweak32: ByteVector32): PrivateKey = {
+      val key = if (publicKey.isEven) this else this.negate
+      key + PrivateKey(tweak32)
+    }
   }
 
   object PublicKey {
@@ -170,6 +244,76 @@ trait Crypto extends CryptoPlatform {
       }
     }
   }
+  /** Secp256k1 Public key We assume that public keys are always compressed
+    *
+    * @param value
+    *   serialized public key, in compressed format (33 bytes)
+    */
+  case class PublicKey(value: ByteVector) extends PublicKeyPlatform(value) {
+    require(
+      value.length == 33,
+      s"pubkey is ${value.length} bytes but should be 33 bytes"
+    )
+    require(isPubKeyValidLax(value), "pubkey is not valid")
+
+    def hash160: ByteVector = Crypto.hash160(value)
+    def xonly: XOnlyPublicKey = XOnlyPublicKey(this)
+    def isValid: Boolean = isPubKeyValidStrict(this.value)
+    def isEven: Boolean = value(0) == 2.toByte
+    def isOdd: Boolean = !isEven
+
+    def +(that: PublicKey): PublicKey = add(that)
+    def -(that: PublicKey): PublicKey = subtract(that)
+    def *(that: PrivateKey): PublicKey = multiply(that)
+
+    override def toString = value.toHex
+  }
+
+  case class XOnlyPublicKey(value: ByteVector32) {
+    def toHex: String = value.toHex
+
+    lazy val publicKey: PublicKey = PublicKey(ByteVector(2) ++ value)
+
+    /**
+      * Calculates a `taggedHash(m,"TapTweak")` where 
+      * `m:ByteVector32` is calculated as:
+      * val m = if(merkleRoot.isEmpty) 
+      *           thisXOnlyPublicKey.value ++ merkleRoot
+      *     else
+                  thisXOnlyPublicKey.value
+      * @param merkleRoot
+      * @return a unique "tweak" corresponding to 
+      */
+    def tweak(merkleRoot: Option[ByteVector32]): ByteVector32 = merkleRoot match {
+      case None => taggedHash(value, "TapTweak")
+      case Some(bv32) => taggedHash(value ++ bv32, "TapTweak")
+    }
+
+    /**
+      * Construct a new `XOnlyPublicKey` by (optionally) tweaking this one
+      * with a `merkleRoot` (the tweak). The tweak is used to create a private
+      * key `t` with corresponding public key `T` and the returned public key
+      * is `this.pointAdd(T)`.
+      * 
+      * @param merkleRoot
+      * @return tweaked XOnlyPublicKey
+      */
+    def outputKey(merkleRoot: Option[ByteVector32] = None): XOnlyPublicKey = 
+      this.pointAdd(PrivateKey(tweak(merkleRoot)).publicKey)
+
+    override def toString = s"XOnlyPublicKey($toHex)"
+  }
+  object XOnlyPublicKey {
+    def apply(pubKey: PublicKey): XOnlyPublicKey = XOnlyPublicKey(
+      ByteVector32(ByteVector.view(pubKey.value.drop(1).toArray))
+    )
+
+    implicit class xonlyOps(lhs: XOnlyPublicKey) {
+      def pointAdd(rhs: PublicKey): XOnlyPublicKey = XOnlyPublicKey(lhs.publicKey + rhs)
+      def plus(rhs: PublicKey): XOnlyPublicKey = pointAdd(rhs)
+      def +(rhs: PublicKey): XOnlyPublicKey = pointAdd(rhs)
+    }
+  }
 
   /** 160 bits bitcoin hash, used mostly for address encoding hash160(input) =
     * RIPEMD160(SHA256(input))
@@ -191,6 +335,15 @@ trait Crypto extends CryptoPlatform {
   def hash256(input: ByteVector): ByteVector32 = ByteVector32(
     sha256(sha256(input))
   )
+  /**
+    * Tagged hash of input as defined in BIP340
+    */
+  def taggedHash(input: ByteVector, tag: String): ByteVector32 = {
+    val hashedTag = sha256(ByteVector(tag.getBytes("UTF-8")))
+    sha256(hashedTag ++ hashedTag ++ input)
+  }
+
+  def fixSize(data: ByteVector): ByteVector32 = ByteVector32(data.padLeft(32))
 
   private def encodeSignatureCompact(
       r: BigInteger,
@@ -283,7 +436,7 @@ trait Crypto extends CryptoPlatform {
       s: BigInteger
   ): (BigInteger, BigInteger) = {
     val s1 =
-      if (s.compareTo(halfCurveOrder) > 0) N.subtract(s) else s
+      if (s.compareTo(halfCurveOrder) > 0) N.bigInteger.subtract(s) else s
     (r, s1)
   }
 
@@ -443,6 +596,14 @@ trait Crypto extends CryptoPlatform {
     ByteVector.fromValidHex(hex)
   }
 
+}
+/**
+  * Concrete implementation
+  * platform-specific things provided by `CryptoPlatform`
+  */
+class DefaultCrypto extends Crypto with CryptoPlatform {
+  lazy val halfCurveOrder = N.shiftRight(1)
+
   /** @param privateKey
     *   private key
     * @return
@@ -493,51 +654,7 @@ trait Crypto extends CryptoPlatform {
     sha256(hashedTag ++ hashedTag ++ input)
   }
 
-  case class XOnlyPublicKey(value: ByteVector32) {
-    def toHex: String = value.toHex
-
-    lazy val publicKey: PublicKey = PublicKey(ByteVector(2) ++ value)
-
-    /**
-      * Calculates a `taggedHash(m,"TapTweak")` where 
-      * `m:ByteVector32` is calculated as:
-      * val m = if(merkleRoot.isEmpty) 
-      *           thisXOnlyPublicKey.value ++ merkleRoot
-      *     else
-                  thisXOnlyPublicKey.value
-      * @param merkleRoot
-      * @return a unique "tweak" corresponding to 
-      */
-    def tweak(merkleRoot: Option[ByteVector32]): ByteVector32 = merkleRoot match {
-      case None => taggedHash(value, "TapTweak")
-      case Some(bv32) => taggedHash(value ++ bv32, "TapTweak")
-    }
-
-    /**
-      * Construct a new `XOnlyPublicKey` by (optionally) tweaking this one
-      * with a `merkleRoot` (the tweak). The tweak is used to create a private
-      * key `t` with corresponding public key `T` and the returned public key
-      * is `this.pointAdd(T)`.
-      * 
-      * @param merkleRoot
-      * @return tweaked XOnlyPublicKey
-      */
-    def outputKey(merkleRoot: Option[ByteVector32] = None): XOnlyPublicKey = 
-      this.pointAdd(PrivateKey(tweak(merkleRoot)).publicKey)
-
-    override def toString = s"XOnlyPublicKey($toHex)"
-  }
-  object XOnlyPublicKey {
-    def apply(pubKey: PublicKey): XOnlyPublicKey = XOnlyPublicKey(
-      ByteVector32(ByteVector.view(pubKey.value.drop(1).toArray))
-    )
-
-    implicit class xonlyOps(lhs: XOnlyPublicKey) {
-      def pointAdd(rhs: PublicKey): XOnlyPublicKey = XOnlyPublicKey(lhs.publicKey + rhs)
-      def plus(rhs: PublicKey): XOnlyPublicKey = pointAdd(rhs)
-      def +(rhs: PublicKey): XOnlyPublicKey = pointAdd(rhs)
-    }
-  }
+  
 
   /** Sign according to BIP340 specification
     * https://github.com/bitcoin/bips/blob/master/bip-0340.mediawiki
