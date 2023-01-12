@@ -8,7 +8,9 @@ object Crypto extends DefaultCrypto {
   object reckless extends scoin.reckless.RecklessButPureCrypto
 }
 
-trait DefaultCrypto extends Crypto
+trait DefaultCrypto extends Crypto {
+  self: Crypto =>
+}
 
 trait Crypto extends CryptoPlatform {
   lazy val halfCurveOrder = N.shiftRight(1)

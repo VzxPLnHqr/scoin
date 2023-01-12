@@ -10,7 +10,7 @@ import scala.language.implicitConversions
 import scodec.bits.ByteVector
 
 private[scoin] trait CryptoPlatform {
-  import Crypto._
+  self: Crypto => 
   import Secp256k1._
 
   monkeyPatch.init()

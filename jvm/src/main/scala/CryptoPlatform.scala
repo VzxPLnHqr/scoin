@@ -23,7 +23,6 @@ import ChaCha20Poly1305.{encrypt => c20p1305encrypt, decrypt => c20p1305decrypt}
 
 private[scoin] trait CryptoPlatform {
   self: Crypto =>
-  //import Crypto._
 
   private val secureRandom = new SecureRandom
   def randomBytes(length: Int): ByteVector = {

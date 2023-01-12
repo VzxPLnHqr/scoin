@@ -14,7 +14,7 @@ import ChaCha20Poly1305.{encrypt => c20p1305encrypt, decrypt => c20p1305decrypt}
 import secp256k1.Secp256k1
 
 private[scoin] trait CryptoPlatform {
-  import Crypto._
+  self: Crypto =>
 
   def randomBytes(length: Int): ByteVector = {
     ByteVector(
@@ -64,7 +64,7 @@ private[scoin] trait CryptoPlatform {
     def add(that: PublicKey): PublicKey = {
       val lhs = curve.CurvePoint.fromUnCompressed(this.toUncompressedBin)
       val rhs = curve.CurvePoint.fromUnCompressed(that.toUncompressedBin)
-      Crypto.PublicKey(Curve.pointAdd(curve)(lhs,rhs).compressed,false)
+      PublicKey(Curve.pointAdd(curve)(lhs,rhs).compressed,false)
     }
 
     def add(that: PrivateKey): PublicKey = ??? // not currently used by any tests
@@ -73,7 +73,7 @@ private[scoin] trait CryptoPlatform {
 
     def multiply(that: PrivateKey): PublicKey = {
       val point = curve.CurvePoint.fromUnCompressed(this.toUncompressedBin)
-      Crypto.PublicKey(
+      PublicKey(
         Curve.multByScalar(curve)(point,BigInt(that.value.toHex,16)).compressed
       )
     }
