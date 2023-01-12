@@ -4,7 +4,13 @@ import java.io.{ByteArrayInputStream, ByteArrayOutputStream}
 import java.math.BigInteger
 import scodec.bits.ByteVector
 
-object Crypto extends CryptoPlatform {
+object Crypto extends DefaultCrypto {
+  object reckless extends scoin.reckless.RecklessButPureCrypto
+}
+
+trait DefaultCrypto extends Crypto
+
+trait Crypto extends CryptoPlatform {
   lazy val halfCurveOrder = N.shiftRight(1)
 
   def fixSize(data: ByteVector): ByteVector32 = ByteVector32(data.padLeft(32))
