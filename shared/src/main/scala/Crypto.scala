@@ -5,12 +5,10 @@ import java.math.BigInteger
 import scodec.bits.ByteVector
 
 object Crypto extends DefaultCrypto {
-  object reckless extends scoin.reckless.RecklessButPureCrypto
+  object reckless extends scoin.reckless.PureAndRecklessCrypto
 }
 
-trait DefaultCrypto extends Crypto {
-  self: Crypto =>
-}
+trait DefaultCrypto extends Crypto
 
 trait Crypto extends CryptoPlatform {
   lazy val halfCurveOrder = N.shiftRight(1)
