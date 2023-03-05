@@ -13,7 +13,7 @@ object Musig2 {
     */
 
   /**
-    * KeyGen Context for Musig2 signing session.
+    * KeyAgg Context for Musig2 signing session.
     *
     * @param pointQ 
     *   The point Q representing the aggregate and potentially tweaked public 
@@ -24,7 +24,7 @@ object Musig2 {
     *   The accumulated tweak tacc: an integer with `0 ≤ accumuatedTweak < n` 
     *   where `n` is the group order.
     */
-  final case class KeyGenCtx ( 
+  final case class KeyAggCtx ( 
     pointQ: PublicKey, 
     gacc: BigInt,
     accumulatedTweak: BigInt
@@ -44,7 +44,7 @@ object Musig2 {
     * @param pubkeys
     * @return
     */
-  def keyAgg(pubkeys: List[PublicKey]): KeyGenCtx = {
+  def keyAgg(pubkeys: List[PublicKey]): KeyAggCtx = {
     // note: max list size is 2^32 - 1
     val pk2 = getSecondKey(pubkeys.map(_.value))
     // if this function is being called, then we assume all PublicKeys in the
@@ -58,7 +58,7 @@ object Musig2 {
 
     // ensure that the aggregate point is not the point at infinity
     require(pointQ.isValid, "invalid aggregate public key")
-    KeyGenCtx(pointQ, gacc = BigInt(1), accumulatedTweak = BigInt(0))
+    KeyAggCtx(pointQ, gacc = BigInt(1), accumulatedTweak = BigInt(0))
   }
 
   private[scoin] def hashKeys(pubkeys: List[PublicKey]): ByteVector32 =
@@ -96,21 +96,21 @@ object Musig2 {
                           ).mod(N)
                       }
   /**
-    * Tweak a `KeyGenCtx` with a tweak value so as to obtain a new
-    * (tweaked) `KeyGenCtx`.
+    * Tweak a `KeyAggCtx` with a tweak value so as to obtain a new
+    * (tweaked) `KeyAggCtx`.
     *
-    * @param keygenCtx
+    * @param keyaggCtx
     * @param tweak
     * @param isXonlyTweak
     * @return
     */
   def applyTweak(
-        keygenCtx: KeyGenCtx,  
+        keyaggCtx: KeyAggCtx,  
         tweak: ByteVector32, 
         isXonlyTweak: Boolean
-        ): KeyGenCtx = {
+        ): KeyAggCtx = {
 
-          val KeyGenCtx(pointQ,gacc,tacc) = keygenCtx
+          val KeyAggCtx(pointQ,gacc,tacc) = keyaggCtx
           val g = if(isXonlyTweak && pointQ.isOdd) 
                     BigInt(-1).mod(N)
                   else BigInt(1)
@@ -121,7 +121,7 @@ object Musig2 {
           require(pointQ1.isValid, "tweaked combined pub key Q is not valid (infinte?)")
           val gacc1 = (g*gacc).mod(N)
           val tacc1 = (t + g*tacc).mod(N)
-          KeyGenCtx(pointQ1,gacc1,tacc1)
+          KeyAggCtx(pointQ1,gacc1,tacc1)
         }
 
   /**
@@ -297,11 +297,11 @@ object Musig2 {
 
   def getSessionValues( ctx: SessionCtx ): SessionValues = {
     // the following will throw if any pubkeys are invalid
-    def keygen_ctx_i(i: Int): KeyGenCtx = i match {
+    def keyagg_ctx_i(i: Int): KeyAggCtx = i match {
       case 0 => keyAgg(ctx.pubKeys.map(PublicKey(_)))
-      case i => applyTweak(keygen_ctx_i(i - 1), ctx.tweaks(i-1), ctx.isXonlyTweak(i-1))
+      case i => applyTweak(keyagg_ctx_i(i - 1), ctx.tweaks(i-1), ctx.isXonlyTweak(i-1))
     }
-    val KeyGenCtx(pointQ, gacc, tacc) = keygen_ctx_i(ctx.numTweaks)
+    val KeyAggCtx(pointQ, gacc, tacc) = keyagg_ctx_i(ctx.numTweaks)
     val b = intModN(
               taggedHash(
                 ctx.aggNonce ++ pointQ.xonly.value.bytes ++ ctx.message,
