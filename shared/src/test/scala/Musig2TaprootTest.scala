@@ -23,7 +23,7 @@ object Musig2TaprootTest extends TestSuite {
       val pointQ = keyaggctx.pointQ
 
       // construct the output public key for the taproot output
-      val outputXOnlyPubKey = pointQ.xonly.outputKey(merkleRoot = None)
+      val outputXOnlyPubKey = pointQ.xonly
 
       // fund a pay2tr output locked to
       val fundingTx = Transaction(
@@ -95,7 +95,7 @@ object Musig2TaprootTest extends TestSuite {
       // just provides some "added protection" in case the available randomness
       // is not the best (think constrained hardware device).
       val (bob_secnonce, bob_pubnonce) = Musig2.nonceGen(
-        secretSigningKey = Some(alice_priv.value),
+        secretSigningKey = Some(bob_priv.value),
         pubKey = bob_pub,
         aggregateXOnlyPublicKey = Some(outputXOnlyPubKey),
         message = Some(z.bytes),
@@ -126,15 +126,184 @@ object Musig2TaprootTest extends TestSuite {
       // Combine the partial signatures into a complete, valid BIP340 signature.
       val sig = Musig2.partialSigAgg(List(alice_psig,bob_psig),ctx)
 
+      // verify that our signature is valid
+      assert(verifySignatureSchnorr(sig,z,pointQ.xonly))
+
       // Update our transaction to include the signature in the witness.
       val signedTx = unsignedSpendingTx.updateWitness(0,ScriptWitness(List(sig)))
 
       // Verify that our spending transaction is valid. The below would throw
       // an exception if not.
-      Transaction.correctlySpends(signedTx,List(fundingTx),ScriptFlags.MANDATORY_SCRIPT_VERIFY_FLAGS)
+      Transaction.correctlySpends(signedTx,List(fundingTx),ScriptFlags.STANDARD_SCRIPT_VERIFY_FLAGS)
+    }
+
+    // Here we encapsulate some of the per-person functionality we need.
+    // We use some scala modifiers like `private[this] def` to emulate that only
+    // the "person" itself can access its own private values.
+    final case class Person(name: String) {
+
+      // naive, insecure, demo purposes only
+      private[this] def seed: ByteVector32 = sha256(ByteVector(name.getBytes))
+
+      def priv: PrivateKey = PrivateKey(sha256(seed))
+
+      def pub: PublicKey = priv.publicKey
+
+      /**
+        * calculate the i'th per commitment secret
+        */
+      private[this] def perCommitSecret(i: Int): PrivateKey =
+        ln.Generators.perCommitSecret(seed,i)
+
+      /** calculate the i'th per commitment point
+       * */
+      def perCommitPoint(i: Int): PublicKey =
+        ln.Generators.perCommitPoint(seed,i)
+
+      /** a blinded public key */
+      def revocationPubKey(remoteNodePerCommitPoint: PublicKey): PublicKey =
+        ln.Generators.revocationPubKey(this.pub,remoteNodePerCommitPoint)
+
+
+      /** Calculate the i'th "publishing" secret
+       *  The publisher of a commitment transaction is forced to reveal
+       *  this secret thereby allowing the other party to punish (if necessary)
+       * */
+      def publishingSecret(i: Int): PrivateKey = 
+        ln.Generators.perCommitSecret(
+          //naive re-use of ln stuff here
+          sha256(ByteVector("publishing secret".getBytes) ++ seed),
+          index = i
+        )
+      
+      /**
+       * The i'th "publishing" public key. This is the point which the remote
+       * party tweaks their real signature with, to get `adapterSig`. If the
+       * real signature `sig` is ever broadcast, the local party can calculate the
+       * publishing secret (it is just `sig - adapterSig`). */
+      def publishingPubKey(i: Int): PublicKey = publishingSecret(i).publicKey
+
+      /**
+        * Generate musig2 nonce
+        *
+        * @param aggregateXOnlyPublicKey
+        * @param message
+        * @param nextRand32
+        * @return (97-byte secNonce, 66-byte pubNonce)
+        */
+      def musig2NonceGen(
+             aggregateXOnlyPublicKey: XOnlyPublicKey, 
+             message: ByteVector,
+             nextRand32: => ByteVector32 ) = Musig2.nonceGen(
+              secretSigningKey = Some(priv.value),
+              pubKey = pub,
+              aggregateXOnlyPublicKey = Some(aggregateXOnlyPublicKey),
+              message = Some(message),
+              extraIn = None,
+              nextRand32 = nextRand32
+      )
+    } // end of Person class
+
+    test("musig2 with taproot - adaptor sigs") {
+      /** Goal: Alice and Bob each end up with a musig2 adaptor signature.
+       *        Each can repair and publish their signature, but by doing 
+       *        so it reveals the publisher's "publishing secret" which is
+       *        which is the discrete logarithm for the publisher's
+       *        "publishing point." 
+       * 
+       * See: https://github.com/t-bast/lightning-docs/blob/master/schnorr.md#musig2-adaptor-signatures
+      */
+      val alice = Person("alice11")
+      val bob = Person("bob")
+
+      // create an aggregate public key (pointQ) in a KeyAggCtx
+      // keyaggctx.pointQ is the aggregate public key
+      val keyaggctx = Musig2.keyAgg(Musig2.keySort(List(alice.pub,bob.pub)))
+      val pointQ = keyaggctx.pointQ
+        
+      // the message we will musig2 sign and then build adaptor signatures for
+      val msg = ByteVector32.fromValidHex("07"*32)
+
+      // generate and exchange pubnonces
+      val (alice_secnonce, alice_pnonce) = alice.musig2NonceGen(
+        aggregateXOnlyPublicKey = pointQ.xonly,
+        message = msg,
+        nextRand32 = ByteVector32.fromValidHex("A0"*32)
+      )
+
+      val (bob_secnonce, bob_pnonce) = bob.musig2NonceGen(
+        aggregateXOnlyPublicKey = pointQ.xonly,
+        message = msg,
+        nextRand32 = ByteVector32.fromValidHex("B0"*32)
+      )
+
+      // aggregate the public nonces
+      val aggnonce = Musig2.nonceAgg(List(alice_pnonce,bob_pnonce))
+
+      // create a signing context (Alice and Bob can each do independently)
+      val ctx = Musig2.SessionCtx(
+        aggNonce = aggnonce,
+        numPubKeys = 2,
+        pubKeys = Musig2.keySort(List(alice.pub,bob.pub)).map(_.value),
+        numTweaks = 0,
+        tweaks = List.empty,
+        isXonlyTweak = List.empty,
+        message = msg
+      )
+
+      // Now Alice generates a partial signature which is tweaked by
+      // Bob's "publishing point" T
+      // She does this by tweaking the aggnonce with the secret before signing.
+      // The aggnonce is represented by two points (R1,R2), so we create a new
+      // aggnonce (R1+T, R2)
+      /*val tweakedAggNonce = aggnonce.splitAt(33) match {
+        case (bytesR1,bytesR2) => 
+          (PublicKey(bytesR1) + bob.publishingPubKey(0)).value ++ bytesR2
+      }
+
+      val tweakedCtx = ctx.copy(aggNonce = tweakedAggNonce)
+
+      println(ctx.sessionValues.b.toString(16))
+      println(tweakedCtx.sessionValues.b.toString(16))*/
+      val (alice_psig,b_alice,e_alice,pointR_alice) = Musig2.signWithAdaptorPoint(
+        secnonce = alice_secnonce,
+        privateKey = alice.priv,
+        ctx = ctx,
+        adaptorPoint = bob.publishingPubKey(0)
+      )
+
+      // Bob creates the adapter signature
+      val (bob_psig,b_bob,e_bob,pointR_bob) = Musig2.signWithAdaptorPoint(
+        secnonce = bob_secnonce,
+        privateKey = bob.priv,
+        ctx = ctx,
+        adaptorPoint = bob.publishingPubKey(0)
+      )
+      assert(b_alice == b_bob)
+      assert(e_alice == e_bob)
+      assert(pointR_alice == pointR_bob)
+      // Alice can/should verify Bob's adapter signature before sending her
+      // partial signature:
+      val e = Musig2.intModN(
+        Crypto.calculateBip340challenge(
+          data = ctx.message,
+          noncePointR = (bob.publishingPubKey(0) + pointR_alice).xonly,
+          publicKey = pointQ.xonly
+        )
+      )
+      assert(e == e_alice)
+      
+      val g = if(pointQ.isEven) BigInt(1) else BigInt(-1).mod(N)
+      val tacc = keyaggctx.accumulatedTweak
+      val s = (Musig2.int(alice_psig)+Musig2.int(bob_psig) + (e*g*tacc).mod(N)).mod(N)
+      assert(
+        (G*PrivateKey(s))
+        ==
+        (pointR_alice + pointQ*PrivateKey(e))
+      )
     }
     
-    test("musig2 with taproot - single-sig offchain non-interactive utxo cycle") {
+    test("musig2 with taproot - offchain non-interactive utxo cycles") {
       // 
       // GOAL: Non-interactive transfer of entire utxo from Alice to Bob and back to Alice
       //       1. Alice and Bob fund a 2-of-2 musig pay2tr keypath-only output
@@ -153,56 +322,10 @@ object Musig2TaprootTest extends TestSuite {
       // How?
       // Make a lightning-like non-interactive unified channel!
       // See "unified" channels - https://suredbits.com/generalized-bitcoin-channels/
+      //      also known as "generalized" channels - https://eprint.iacr.org/2020/476.pdf
       // See also "Pathcoin" - https://gist.github.com/AdamISZ/b462838cbc8cc06aae0c15610502e4da
 
-      // First we encapsulate some of the per-person functionality we need.
-      // We use some scala modifiers like `private[this] def` to emulate that only
-      // the "person" itself can access its own private values.
-      final case class Person(name: String) {
-
-        // naive, insecure, demo purposes only
-        private[this] def seed: ByteVector32 = sha256(ByteVector(name.getBytes))
-
-        private [this] def priv: PrivateKey = PrivateKey(sha256(seed))
-
-        def pub: PublicKey = priv.publicKey
-
-        /**
-          * calculate the i'th per commitment secret
-          */
-        private[this] def perCommitSecret(i: Int): PrivateKey =
-          ln.Generators.perCommitSecret(seed,i)
-
-        /** calculate the i'th per commitment point
-         * */
-        def perCommitPoint(i: Int): PublicKey =
-          ln.Generators.perCommitPoint(seed,i)
-
-        /** a blinded public key */
-        def revocationPubKey(remoteNodePerCommitPoint: PublicKey): PublicKey =
-          ln.Generators.revocationPubKey(this.pub,remoteNodePerCommitPoint)
-
-
-        /** Calculate the i'th "publishing" secret
-         *  The publisher of a commitment transaction is forced to reveal
-         *  this secret thereby allowing the other party to punish (if necessary)
-         * */
-        private[this] def publishingSecret(i: Int): PrivateKey = 
-          ln.Generators.perCommitSecret(
-            //naive re-use of ln stuff here
-            sha256(ByteVector("publishing secret".getBytes) ++ seed),
-            index = i
-          )
-        
-        /**
-         * The i'th "publishing" public key. This is the point which the remote
-         * party tweaks their real signature with, to get `adapterSig`. If the
-         * real signature `sig` is ever broadcast, the local party can calculate the
-         * publishing secret (it is just `sig - adapterSig`). */
-        def publishingPubKey(i: Int): PublicKey = publishingSecret(i).publicKey
-      }
-
-      // Create our people.
+      // Create our people (see definition of `Person` class above)
       val alice = Person("alice")
       val bob = Person("bob")
 
@@ -263,8 +386,7 @@ object Musig2TaprootTest extends TestSuite {
        * tapscripts.
        * */
       def unsignedCommitTx(
-            i: Int, // the i'th commitment transaction to calculate
-            fundingOutPoint: OutPoint
+            i: Int // the i'th commitment transaction to calculate
         ): Transaction = {
           // specify the script branches:
           //
@@ -298,8 +420,18 @@ object Musig2TaprootTest extends TestSuite {
           )
           val bobPunishes = OP_PUSHDATA(bobAggPubKey.xonly) :: OP_CHECKSIG :: Nil
 
-          // We only do the two punishing branches for this demo.
-          val scripts = List(alicePunishes, bobPunishes)
+          // The third branch of the commitTx is is the one which is spendable
+          // by the "state transaction." The state transaction is what allocates
+          // the sats to whatever set of outputs was agreed upon by the parties
+          // (the state of the channel). We call this branch the "delayThenPay"
+          // branch. Here we choose a delay of approximately 3 months (in blocks).
+          val timeoutNumBlocks = 144*30*3.toLong
+          val delayThenPay = OP_PUSHDATA(Script.encodeNumber(timeoutNumBlocks))
+                            :: OP_CHECKSEQUENCEVERIFY :: OP_DROP
+                            // now push the Alice & Bob aggregate pubkey (pointQ)
+                            :: OP_PUSHDATA(pointQ.xonly) :: OP_CHECKSIG :: Nil
+
+          val scripts = List(alicePunishes, bobPunishes, delayThenPay)
           val leaves = scripts.zipWithIndex.map { case (script, idx) =>
               ScriptLeaf(idx, Script.write(script), Script.TAPROOT_LEAF_TAPSCRIPT)
           }
@@ -322,14 +454,47 @@ object Musig2TaprootTest extends TestSuite {
           )
       }
 
-      // With the above function in place, we can calculate N commitment transactions.
-      // for N = 10
-      val unsignedCommitTxs = (0 until 10).map(i => unsignedCommitTx(i,fundingOutPoint))
-      unsignedCommitTxs.foreach(println(_))
+      // Now we need to create our "state transactions," which spend the commitment
+      // transactions. A state transaction spends the "delayThenPay" path of a
+      // commitment transaction and then allocates the sats accordingly. 
+      
+      // In our case the allocation made by the state transaction is trivial:
+      // State 0: all goes to Alice
+      // State 1: all goes to Bob
+      // State 2: all goes to Alice
+      // State i if i is even: all goes to Alice
+      // State i if i is odd: all goes to Bob
+      def unsignedStateTx(i: Int, commitTxVout: Int = 0): Transaction = {
+        val commitTxOutPoint = OutPoint(unsignedCommitTx(i),commitTxVout)
+        val payeePubKey = if(i % 2 == 0) alice.pub else bob.pub
+        Transaction(
+          version = 2,
+          txIn = Seq(TxIn(
+            outPoint = commitTxOutPoint,
+            signatureScript = ByteVector.empty,
+            sequence = (144*30*3).toLong, // approximately 3 months (in blocks)
+            witness = ScriptWitness.empty
+            )),
+          txOut = Seq(TxOut(
+            amount = fundingAmount,
+            publicKeyScript = Script.pay2tr(payeePubKey.xonly.outputKey(merkleRoot = None))
+          )),
+          lockTime = 0L
+        )
+      }
 
-      // Next we need to calculate and exchange adapter signatures. For Alice
-      // to transfer the utxo to Bob non-interactively, at step `i`, she will 
-      // need to furnish Bob with:
+      // With the above functions in place, we can calculate N commitment 
+      // transactions and corresponding state transactions.
+      // for N = 10
+      val unsignedTxs = (0 until 10).map(i => (unsignedCommitTx(i) -> unsignedStateTx(i)))
+      //unsignedTxs.foreach(println(_))
+
+      // Because our state transactions are pre-determined and simply alternate,
+      // we can sign and exchange all of them during setup.
+
+      // Next we need to calculate the adapter signaatures for the commitment
+      // transactions. For Alice to transfer the utxo to Bob non-interactively, 
+      // at step `i`, she will need to furnish Bob with:
       //    - an an adapter signature for the commitment transaction,
       //    - and her per-commitment secret
       //

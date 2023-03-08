@@ -135,7 +135,7 @@ object Musig2 {
     * @param message
     * @param extraIn
     * @param nextRand32 the next 32-bytes from cryptographically secure randomness
-    * @return (secNonce, pubNonce)
+    * @return (97-byte secNonce, 66-byte pubNonce)
     */
   def nonceGen(
         secretSigningKey: Option[ByteVector32],
@@ -416,5 +416,62 @@ object Musig2 {
     val pubnonce = (G*PrivateKey(k1p)).value ++ (G*PrivateKey(k2p)).value
     require(partialSigVerifyInternal(psig,pubnonce,pointP,ctx),"invalid partial signature, your parameters")
     psig
+  }
+
+  def signWithAdaptorPoint(
+                secnonce: ByteVector, privateKey: PrivateKey, 
+                ctx: SessionCtx, adaptorPoint: PublicKey) = {
+    
+    val SessionValues(pointQ, gacc, _, bOld, pointROld, eOld) = getSessionValues(ctx)
+    
+    val tweakedAggNonce = ctx.aggNonce.splitAt(33) match {
+        case (bytesR1,bytesR2) => 
+          (PublicKey(bytesR1) + adaptorPoint).value ++ bytesR2
+    }
+    val b = intModN(
+              taggedHash(
+                tweakedAggNonce ++ pointQ.xonly.value.bytes ++ ctx.message,
+                "MuSig/noncecoef"
+              )
+            )
+    val (pointR1,pointR2) = (
+                              cpoint_ext(ctx.aggNonce.slice(0,33)),
+                              cpoint_ext(ctx.aggNonce.slice(33,66))
+                            )
+    // if above fails, we should throw error and blame nonce aggregator for invalid aggNonce
+
+    val pointRfinal = point_add_ext(pointR1,pointR2.map(_ * PrivateKey(b))) match {
+      case None => G // if inifite, use point G instead
+      case Some(pt) => pt
+    }
+    require(pointRfinal.isValid,"final nonce invalid (point at infinity maybe?)")
+    val e = intModN(
+              Crypto.calculateBip340challenge(
+                data = ctx.message,
+                noncePointR = (adaptorPoint + pointRfinal).xonly,
+                publicKey = pointQ.xonly
+              )
+            ) 
+    val (k1p, k2p) = (int(secnonce.slice(0,32)),int(secnonce.slice(32,64)))
+    require( k1p != 0 && k2p != 0, "secnonce k1, k2 cannot be zero")
+    require( k1p < N && k2p < N, "secnonces k1,k2 cannot exceed group order")
+    val n = BigInt(N)
+    val (k1, k2) = if(pointRfinal.isEven) (k1p,k2p) else (n - k1p, n - k2p)
+    val pointP = privateKey.publicKey
+    require(pointP.value == secnonce.slice(64,97),"secnonce does not match signing public key")
+    val a = getSessionKeyAggCoeff(ctx,pointP)
+    val g = if(pointQ.isEven) BigInt(1) else BigInt(-1).mod(n)
+    val d = (g*gacc*BigInt(privateKey.value.toHex,16)).mod(n) // see: negation of secret key when signing
+    val s = (k1 + b*k2 + e*a*d).mod(n)
+    val psig = PrivateKey(s).value
+    //val pubnonce = (G*PrivateKey(k1p)).value ++ (G*PrivateKey(k2p)).value
+    //require(partialSigVerifyInternal(psig,pubnonce,pointP,ctx),"invalid partial signature, your parameters")
+    (psig,b,e,pointRfinal)
+  }
+  /**
+    * Syntax helpers
+    */
+  implicit class sessionCtxOps(ctx: SessionCtx) {
+    def sessionValues = getSessionValues(ctx)
   }
 }
