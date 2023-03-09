@@ -29,7 +29,8 @@ object NonInteractiveCycleChannelsTest extends TestSuite {
     //      also known as "generalized" channels - https://eprint.iacr.org/2020/476.pdf
     // See also "Pathcoin" - https://gist.github.com/AdamISZ/b462838cbc8cc06aae0c15610502e4da
 
-    // Create our people (see definition of `Person` class above)
+    // Create our people (see definition of `reckless.Person` -- it just provides
+    // some convenient "wallet-like" methods for us for testing purposes)
     val alice = Person("alice")
     val bob = Person("bob")
 
@@ -38,15 +39,15 @@ object NonInteractiveCycleChannelsTest extends TestSuite {
     val keyaggctx = Musig2.keyAgg(List(alice.pub, bob.pub))
     val pointQ = keyaggctx.pointQ
 
-    // Construct the output public key for the taproot output
+    // Construct the output public key for the funding taproot output
+    // This output will be spent via key-spend only (using musig2!), so there 
+    // is no need to tweak it with a merkle root.
     val outputXOnlyPubKey = pointQ.xonly
 
     // Fund a pay2tr output locked to the aggregated output key
     val fundingTx = Transaction(
       version = 2,
-      txIn = List(
-        TxIn.coinbase(OP_1 :: OP_1 :: Nil) // bogus coinbase
-      ),
+      txIn = List.empty, // bogus coinbase
       txOut = List(
         TxOut(
           amount = Satoshi(1_000_000L),
@@ -62,6 +63,9 @@ object NonInteractiveCycleChannelsTest extends TestSuite {
     // Remember the OutPoint (needed by commitment transactions)
     val fundingOutPoint = OutPoint(fundingTx,fundingVout)
 
+    // The below constant is used by the delay branch of all commitment transactions
+    val timeoutNumBlocks = 144*30*3.toLong
+
     /** Calculate the i'th commitment transaction. 
      * 
      * Generally, each commitment transaction revokes the prior commitment 
@@ -76,7 +80,8 @@ object NonInteractiveCycleChannelsTest extends TestSuite {
      * 
      * What we need the signed/broadcasted commitment transaction to do is
      * include information as to who broadcast it so that the non-broadcasting
-     * partner can punish, if necessary.
+     * partner can punish, if necessary. This information transmission is
+     * accomplished with adaptor signatures, musig2 style.
      * 
      * Our commitment transaction has a single output, and a script with three
      * branches. Of course all of these branches could be encoded in a single
@@ -84,7 +89,7 @@ object NonInteractiveCycleChannelsTest extends TestSuite {
      * we instead encode the script branches as tapleafs, construct the merkle
      * root, and the pay2tr output (optionally, with keypath spending disabled). 
      * 
-     * Technically, keypath spending neednot be disabled since even after 
+     * Technically, keypath spending need not be disabled because even after 
      * the commitment transaction has been broadcast, the two parties could 
      * still choose to cooperate to close the channel without revealing the 
      * tapscripts.
@@ -96,18 +101,19 @@ object NonInteractiveCycleChannelsTest extends TestSuite {
         //
         // Alice can punish (spend immediately) if she know's both:
         //  `r_i`, the revocation secret corresponding to Alice's i'th
-        //         blinded revocation pubkey which further corresponds with
-        //         Bob's i'th per-commitment Point.
+        //         blinded revocation pubkey. When Bob gives alice his
+        //         i'th per-commitment secret, only Alice will be able to calculate
+        //         the revocation secret `r_i`, as the calculation depends on her
+        //         private key.
+        // 
         //  `y_i`, the publishing secret corresponding to Bob's i'th 
         //         publishing public key
-        //  `d_a`, her own private key.
         //
         // Here we only need to know the points and construct a script branch
         // representing a spending condition requiring a musig2 signature for
-        // the aggregate key of all three of the above points.
+        // the aggregate key of the above points.
         val Musig2.KeyAggCtx(aliceAggPubKey,_,_) = Musig2.keyAgg(
           List(
-            alice.pub, 
             alice.revocationPubKey(bob.perCommitPoint(i)),
             bob.publishingPubKey(i)
           )
@@ -116,8 +122,7 @@ object NonInteractiveCycleChannelsTest extends TestSuite {
 
         // Repeat, but for Bob.
         val Musig2.KeyAggCtx(bobAggPubKey,_,_) = Musig2.keyAgg(
-          List(
-            bob.pub, 
+          List( 
             bob.revocationPubKey(alice.perCommitPoint(i)),
             alice.publishingPubKey(i)
           )
@@ -128,8 +133,10 @@ object NonInteractiveCycleChannelsTest extends TestSuite {
         // by the "state transaction." The state transaction is what allocates
         // the sats to whatever set of outputs was agreed upon by the parties
         // (the state of the channel). We call this branch the "delayThenPay"
-        // branch. Here we choose a delay of approximately 3 months (in blocks).
-        val timeoutNumBlocks = 144*30*3.toLong
+        // branch.
+        // 
+        // Notice how this branch is locked to the same Alice+Bob aggregate
+        // public key (pointQ).
         val delayThenPay = OP_PUSHDATA(Script.encodeNumber(timeoutNumBlocks))
                           :: OP_CHECKSEQUENCEVERIFY :: OP_DROP
                           // now push the Alice & Bob aggregate pubkey (pointQ)
@@ -197,19 +204,59 @@ object NonInteractiveCycleChannelsTest extends TestSuite {
     // Because our state transactions are pre-determined and simply alternate,
     // we can sign and exchange all of them during setup.
 
-    // Next we need to calculate the adapter signaatures for the commitment
-    // transactions. For Alice to transfer the utxo to Bob non-interactively, 
-    // at step `i`, she will need to furnish Bob with:
-    //    - an an adapter signature for the commitment transaction,
-    //    - and her per-commitment secret
+    // Next we need to calculate the adapter signatures for the commitment
+    // transactions. While the commitment transaction held by each party
+    // is the same, for each commitment transaction, each party will 
+    // have an adaptor signature where the addaptor point is chosen to be 
+    // the other party's publishing point.
     //
-    // Both of these items can be computed at setup.
+    // Therefore, the party who publishes the commitment transaction is also
+    // revealing its corresponding publishing secret.
+    // 
+    // The adaptor signatures can be exchanged and verified at setup time.
+    // 
+    // At setup time, each party will also calculate their per-commitment
+    // secrets, and corresponding per-commitment points. They exchange the
+    // per-commitment points, but keep the per-commitment secrets to themselves.
+    // 
+    // For Alice to transfer the utxo to Bob non-interactively, at step `i`, 
+    // she will simply need to furnish Bob with her `i`th per-commitment secret.
+    // This can be done via email, text message, file drop, or a plain old hand
+    // written note.
+    // 
+    // Each per-commitment secret is just a 256-bit number, similar to a private
+    // key. As such, encoding it as a BIP39 sequence of 12 or 24 words is an
+    // interesting idea.
+    //
+    // While the transfer of the UTXO here is non-interactive, there is still a
+    // requirement for the receiver:
+    //         - to verify the per-commitment secret (can be done offline)
+    //         - monitor the blockchain for broadcast of the old (now revoked)
+    //           commitment transaction.
+    // 
+    // The adaptor signatures exchanged and verified at setup time ensure that
+    // we know *who* published a given commitment transaction, and also furnishes
+    // the non-publishing party with half of the information necessary to spend
+    // the utxo immediately. The other half is provided by per-commitment secret.
+    //
+    // For example, say we are just starting out (state i = 0). The setup is 
+    // complete, and the signed state transaction assigns the funds to Alice by
+    // spendng the delay path of the 0th commitment transaction.
+    // 
+    // Alice can simply broadcast the commitment transaction, wait, then broadcast
+    // the state transaction. She will the the ultimate beneficiary.
+    //
+    // Alternatively, Alice can provide Bob with her 0th per-commitment secret,
+    // thereby assigning the utxo to Bob. Now, if she ever broadcasts the 0th
+    // commitment transaction, Bob will learn her 0th publishing secret, and now
+    // has all the information necessary to claim the utxo.
 
-    // The adapter signature is approximately 96 bytes, and the per-commitment
-    // secret is 32-bytes. So the total per-transfer overhead is around 128 bytes.
+    // We are now in state i = 1. Bob owns the utxo. He can transfer it back to
+    // Alice by providing her his per-commitment secret, thereby transitioning
+    // to state i = 2.
 
-    // If she ever broadcasts a commitment transaction for which she has previously
-    // furnished Bob with a (valid) adapter signature, Bob will have time to
-    // punish her and transfer the funds.
+    // The pattern continues until i = N, at which point the parties will need to
+    // continue their setup process and generate more commitment and state transactions.
+    
   }
 }
